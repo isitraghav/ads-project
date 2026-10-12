@@ -1,0 +1,508 @@
+================================================================================
+RebalanceIQ
+A Bike-Share Demand Forecasting and Fleet Rebalancing Decision System
+================================================================================
+
+Course       : Applied Data Science (ADS) - Interim Project
+Framework    : BADIR (Business question, Analysis plan, Data collection,
+               Insights, Recommendations)
+Final output : Integrated single-source-of-truth dataset, models, interactive
+               decision dashboard, and BADIR report
+
+
+--------------------------------------------------------------------------------
+1. EXECUTIVE SUMMARY
+--------------------------------------------------------------------------------
+
+Bike-share systems constantly become unbalanced. In the morning, bikes flow out
+of residential neighbourhoods into business districts; in the evening the flow
+reverses. Some stations run empty (customers cannot start a ride) while others
+fill up (customers cannot return a bike). Every empty or full station means
+lost rides, lost revenue and frustrated customers. Operators fix this by moving
+bikes with vans and trikes, but rebalancing crews and vehicles are expensive
+and limited.
+
+RebalanceIQ integrates official Citi Bike trip and station data with weather,
+calendar, public-event, subway-ridership and census data into one unified
+dataset, and uses it to:
+  1. explain what drives bike demand at each station and hour,
+  2. forecast hourly pickups and drop-offs per station,
+  3. predict which stations are at risk of running empty or full,
+  4. recommend which bikes to move, from where, to where and when, within a
+     daily rebalancing budget,
+  5. estimate the operational and financial impact (rides recovered, cost,
+     net value) compared with simpler strategies.
+
+
+--------------------------------------------------------------------------------
+2. PROBLEM STATEMENT
+--------------------------------------------------------------------------------
+
+Business problem
+  Citi Bike (New York City) operates more than 2,000 stations. Demand varies
+  strongly by hour, day, season, weather, location and nearby activity.
+  Operations managers need to know:
+    - How many bikes will be picked up and returned at each station in the
+      coming hours?
+    - Which stations will run out of bikes or docks, and when?
+    - Where should the limited rebalancing fleet move bikes to recover the
+      most rides for the money spent?
+
+Why it matters
+  - An empty station loses every ride that would have started there.
+  - A full station blocks returns, creating poor customer experience and
+    extra trips for riders.
+  - Rebalancing resources (staff hours, vans, trikes) are limited, so they
+    must be directed where they create the most value.
+
+Primary business objective
+  Maximize net value per day:
+      revenue from rides recovered by rebalancing
+    - cost of rebalancing moves
+  within a fixed daily operating budget.
+
+Policy relevance
+  Bike-share is part of New York City's public transport and sustainability
+  strategy. Results also inform city planners (NYC DOT) on where station
+  capacity or bike-lane investment would reduce chronic imbalance.
+
+
+--------------------------------------------------------------------------------
+3. STAKEHOLDERS AND DECISIONS SUPPORTED
+--------------------------------------------------------------------------------
+
+  Stakeholder                 Decision supported
+  --------------------------  ---------------------------------------------------
+  Operations manager          Daily rebalancing plan and crew allocation
+  Dispatch team               Which station to serve next, how many bikes
+  Finance                     Rebalancing budget vs. rides and revenue recovered
+  Planning / NYC DOT          Where to add docks, stations or bike lanes
+  Marketing                   Member vs. casual demand patterns, promotions
+
+
+--------------------------------------------------------------------------------
+4. DATA SOURCES AND PROVENANCE
+--------------------------------------------------------------------------------
+
+All sources are official operators, government portals, government APIs or
+research repositories. No Kaggle data is used.
+
+  #  Source / Dataset                Provider (access)              Granularity
+  -- ------------------------------  -----------------------------  ------------------
+  S1 Citi Bike System Trip Data      Lyft / Citi Bike, official      One row per trip
+                                     S3 bucket (s3.amazonaws.com/
+                                     tripdata), linked from
+                                     citibikenyc.com/system-data
+  S2 Citi Bike GBFS feed -           Citi Bike official GBFS API     One row per station
+     station_information, pricing    (gbfs.citibikenyc.com, served
+     plans, regions, vehicle types   from gbfs.lyft.com)
+  S3 Station status history          GBFS station_status snapshots   Station x ~12 min
+     (bikes / docks available)       archived by the open research
+                                     repository bike-sharing-history
+                                     (GitHub; monthly Parquet
+                                     exports on Google Cloud Storage)
+  S4 Hourly weather                  NOAA National Centers for       Hourly
+                                     Environmental Information,
+                                     Local Climatological Data,
+                                     Central Park (WBAN 94728) and
+                                     LaGuardia (WBAN 14732)
+  S5 Subway hourly ridership         MTA via NY State Open Data      Station complex x hour
+                                     (data.ny.gov, "MTA Subway
+                                     Hourly Ridership: Beginning
+                                     2025", Socrata API)
+  S6 Permitted events                NYC Open Data, "NYC Permitted   One row per event
+                                     Event Information"
+  S7 Bike routes / lanes             NYC DOT via NYC Open Data,      Street segment
+                                     "New York City Bike Routes"
+  S8 Demographics and commuting      US Census Bureau, American      Census tract
+                                     Community Survey 2019-2023
+                                     5-year, table-based summary
+                                     files (www2.census.gov)
+  S9 Employment by location          US Census Bureau, LEHD LODES    Census block
+                                     Workplace Area Characteristics
+  S10 Census tract boundaries        US Census Bureau TIGER/Line     Polygon
+  S11 Holidays and school calendar   US federal holiday calendar     Day
+                                     (OPM) and NYC Public Schools
+                                     calendar
+  S12 Pricing and operating figures  Citi Bike pricing page and      Monthly / static
+                                     Monthly Operating Reports
+                                     (citibikenyc.com/system-data)
+
+Provenance documentation
+  For every source the project records: URL / endpoint, publisher, licence or
+  terms of use, date downloaded, time period covered, file names / API query,
+  number of rows and columns, and known data issues.
+
+Study scope
+  - Period: 12 months (January - December 2025), allowing full seasonal
+    analysis. 2025 is the most recent full year with complete coverage in
+    every source, including the station-status history.
+  - Area: all NYC stations for analysis; dashboard and rebalancing simulation
+    can focus on Manhattan (highest imbalance).
+  - Size: tens of millions of trip rows; the unified station-hour table holds
+    several million rows (approx. 2,000+ stations x 8,760 hours).
+
+
+--------------------------------------------------------------------------------
+5. SINGLE SOURCE OF TRUTH (SSOT): DATA INTEGRATION
+--------------------------------------------------------------------------------
+
+5.1 Integrated data model
+
+  The SSOT is a star schema stored as Parquet files (or a DuckDB / PostgreSQL
+  database):
+
+    fact_trips             one row per trip (cleaned S1)
+    fact_station_hour      one row per station per hour (MAIN ANALYTICAL TABLE)
+    dim_station            one row per station (S2 + S7 + S8 + S9 + S10 + S5
+                           locations)
+    dim_time               one row per hour (S4 + S11)
+    dim_event              one row per event (S6), mapped to nearby stations
+
+5.2 Identifiers and join logic
+
+  Join                          Key / method
+  ----------------------------  -----------------------------------------------
+  Trips -> stations             trip start_station_id / end_station_id matched
+                                to GBFS short_name; unmatched IDs resolved by
+                                station name and coordinates (nearest station
+                                within 50 m)
+  Station status -> stations    GBFS station_id
+  Trips / status -> time        timestamp truncated to the hour
+                                (America/New_York time zone)
+  Weather -> time               NOAA observation time rounded to the hour;
+                                multiple readings in one hour averaged
+  Subway -> stations            spatial join: subway station complexes within
+                                500 m of each bike station; ridership summed
+                                per station-hour
+  Events -> stations            event location geocoded; events within 1 km of
+                                a station and active during the hour counted
+  Bike lanes -> stations        total bike-lane length within 500 m (spatial)
+  Census ACS / LODES -> stations station point-in-polygon to census tract
+                                (TIGER/Line); LODES jobs summed within 500 m
+  Holidays / school days -> time calendar date
+
+5.3 Schema and unit consistency
+
+  - All timestamps converted to America/New_York local time (the status
+    archive is stored in UTC); daylight saving
+    transitions handled explicitly.
+  - Distances in kilometres (haversine from latitude / longitude), durations
+    in minutes, temperature in degrees Celsius, precipitation in millimetres,
+    wind speed in km/h, money in US dollars.
+  - Consistent snake_case column names and data types across all tables.
+  - Station IDs stored as strings (to keep formats such as "6140.05").
+
+5.4 Duplicate handling
+
+  - Duplicate ride_id values removed.
+  - Duplicate status snapshots (same station, same timestamp) removed.
+  - Duplicate weather records (multiple report types per hour) resolved by
+    priority rule (routine hourly report first).
+  - Stations that were renamed or relocated tracked with valid-from / valid-to
+    dates.
+
+5.5 Data-quality checks
+
+  - Completeness: % missing per column, per source; missing hours in weather
+    and status series.
+  - Validity: trip duration between 1 minute and 24 hours; coordinates inside
+    NYC bounding box; capacity > 0; non-negative counts.
+  - Consistency: end time after start time; bikes + docks available not
+    exceeding capacity; station-hour pickups equal trip counts from fact_trips.
+  - Outliers: abnormal trip durations, speeds, and station counts flagged.
+  - Reconciliation: monthly trip totals compared with Citi Bike Monthly
+    Operating Reports.
+  - All checks implemented as automated tests and summarised in a data-quality
+    report.
+
+5.6 Main analytical table: fact_station_hour (40+ variables)
+
+  Keys and time
+    1  station_id              2  datetime_hour          3  date
+    4  hour                    5  day_of_week            6  is_weekend
+    7  month                   8  season                 9  is_holiday
+    10 is_school_day
+
+  Demand (from trips)
+    11 pickups                 12 dropoffs               13 net_flow
+    14 pickups_member          15 pickups_casual         16 pickups_ebike
+    17 pickups_classic         18 avg_trip_duration_min  19 avg_trip_distance_km
+    20 pickups_lag_1h          21 pickups_lag_24h        22 pickups_lag_168h
+    23 pickups_rolling_mean_7d
+
+  Station attributes
+    24 latitude                25 longitude              26 capacity
+    27 borough                 28 neighbourhood          29 station_cluster
+    30 bike_lane_km_500m       31 stations_within_500m   32 dist_to_subway_m
+
+  Station status
+    33 avg_bikes_available     34 avg_ebikes_available   35 avg_docks_available
+    36 minutes_empty           37 minutes_full
+
+  Weather
+    38 temperature_c           39 precipitation_mm       40 wind_speed_kmh
+    41 relative_humidity       42 visibility_km          43 snow_flag
+
+  Activity and demographics
+    44 events_within_1km       45 subway_ridership_500m  46 tract_population
+    47 median_household_income 48 pct_commute_by_bike    49 pct_commute_transit
+    50 jobs_within_500m
+
+  Targets
+    pickups / dropoffs next hours (forecasting); empty_next_2h / full_next_2h
+    (classification); estimated_unmet_demand.
+
+
+--------------------------------------------------------------------------------
+6. BADIR FRAMEWORK APPLIED
+--------------------------------------------------------------------------------
+
+6.1 B - BUSINESS QUESTION
+
+  "Given a limited daily rebalancing budget, which stations should receive or
+   give up bikes, how many, and when, to maximize rides served and net value?"
+
+  KPIs
+    - Rides served and estimated rides lost (unmet demand)
+    - Station empty-minutes and full-minutes
+    - Rebalancing cost per day and per bike moved
+    - Net value of rebalancing (revenue recovered - cost)
+    - Forecast accuracy (MAE, RMSE) and risk-prediction quality (precision,
+      recall)
+
+
+6.2 A - ANALYSIS PLAN
+
+  Hypotheses (tested statistically)
+    H1  Weekday demand peaks at commute hours; weekend demand peaks midday
+        (compare hourly profiles; t-test / ANOVA).
+    H2  Rain and low temperatures reduce ridership; the effect is stronger for
+        casual riders than members (regression with interaction; t-test).
+    H3  Member vs. casual usage differs by station type and time
+        (chi-square test of independence).
+    H4  Stations near subway stations and dense employment show stronger
+        commute-time imbalance (correlation / regression).
+    H5  Large public events increase nearby demand (difference in means,
+        event vs. comparable non-event hours).
+    H6  A small share of stations accounts for most empty/full minutes
+        (Pareto analysis).
+    H7  More bike-lane coverage is associated with higher station demand.
+
+  Analysis steps
+    1. Data integration into the SSOT and data-quality report.
+    2. Exploratory data analysis and visualisation (time, space, rider type).
+    3. Hypothesis testing (H1 - H7).
+    4. Station segmentation by demand profile (clustering).
+    5. Demand forecasting (regression and time-series models).
+    6. Empty / full risk prediction (classification).
+    7. Rebalancing recommendation and impact simulation.
+
+
+6.3 D - DATA COLLECTION AND PREPARATION
+
+  - Download and load all sources S1 - S12 (scripts for each source, logged).
+  - Clean each source (Section 5.5) and integrate into the SSOT (Section 5).
+  - Feature engineering: calendar features, lag and rolling features, weather
+    categories (dry / light rain / heavy rain), spatial features, cluster
+    labels.
+  - Unmet-demand estimate: for hours when a station was empty, expected
+    demand is estimated from comparable hours when it had bikes available.
+  - Time-based train / validation / test split (e.g. train Jan - Sep,
+    validate Oct, test Nov - Dec). No random shuffling of time-series data.
+
+
+6.4 I - INSIGHTS (METHODS AND MODELS)
+
+  Descriptive analytics
+    - Hourly, daily, weekly and seasonal demand patterns.
+    - Net-flow maps (sources vs. sinks) for morning and evening peaks.
+    - Member vs. casual, e-bike vs. classic usage.
+    - Pareto analysis of problem stations.
+
+  Station segmentation (clustering)
+    - K-means (and hierarchical clustering for comparison) on normalised
+      24-hour weekday / weekend demand profiles and station features.
+    - Expected clusters: residential, business district, tourist / leisure,
+      transit hub, mixed.
+    - Cluster quality: elbow method and silhouette score.
+
+  Demand forecasting (regression / time series)
+    Target: pickups and drop-offs per station per hour.
+    Models compared
+      - Baselines: historical average for the same hour and weekday;
+        seasonal naive (same hour last week).
+      - Time series: exponential smoothing / SARIMA at cluster level.
+      - Linear and regularised regression (Ridge / Lasso).
+      - Tree-based models: decision tree, random forest, gradient boosting.
+    Evaluation: MAE, RMSE, MAPE (on non-zero hours), time-based
+    cross-validation, error broken down by cluster and hour.
+
+  Empty / full risk prediction (classification)
+    Target: will the station be empty (or full) within the next 2 hours?
+    Models: logistic regression, decision tree, random forest, gradient
+    boosting.
+    Evaluation: confusion matrix, precision, recall, F1, ROC-AUC; threshold
+    chosen by cost of missed stockouts vs. unnecessary truck visits.
+
+  Explainability
+    - Regression coefficients and feature importance.
+    - SHAP values for tree-based models: global drivers (hour, weather,
+      station type, events) and station-level explanations, e.g.
+        "Station W 52 St & 6 Ave likely empty by 9 am: weekday commute peak,
+         dry weather, 3,000 jobs within 500 m, current stock 4 bikes."
+
+
+6.5 R - RECOMMENDATIONS
+
+  Recommendation 1: Daily rebalancing plan (core decision)
+    For each planning window (e.g. 6 am, 3 pm, overnight):
+      1. Projected bikes at each station = current bikes + forecast drop-offs
+         - forecast pickups.
+      2. Deficit stations: projected bikes below a safety level.
+         Surplus stations: projected bikes above a maximum level
+         (close to capacity).
+      3. Value of each move = expected rides recovered x revenue per ride.
+         Cost of each move = fixed cost per stop + cost per km + cost per bike.
+      4. Greedy prioritisation: rank deficit stations by rides at risk; serve
+         each from the nearest surplus station(s); repeat until the daily
+         budget or fleet capacity is used.
+    Output: list of moves - from station, to station, number of bikes, time
+    window, expected rides recovered, cost, net value.
+
+  Recommendation 2: Station-level structural actions
+    - Stations that are chronically empty or full -> add docks, add a nearby
+      station, or set up a "valet" / corral service at peak times.
+    - Input for NYC DOT on bike-lane and station-network planning.
+
+  Recommendation 3: Rider-incentive opportunities
+    - Identify trips where rewarding riders to return bikes to deficit
+      stations would be cheaper than van moves.
+
+  Recommendation 4: Operational scheduling
+    - Crew shift planning based on when and where imbalance builds up.
+
+
+--------------------------------------------------------------------------------
+7. BASELINES FOR COMPARISON
+--------------------------------------------------------------------------------
+
+  B1  No rebalancing
+  B2  Fixed schedule: refill the same top-N busiest stations every day
+  B3  Reactive: refill stations only after they are empty
+  B4  RebalanceIQ: forecast-driven, value-ranked rebalancing plan
+
+
+--------------------------------------------------------------------------------
+8. SIMULATION AND FINANCIAL IMPACT
+--------------------------------------------------------------------------------
+
+  Simulation method
+    1. Replay test-period days hour by hour using actual demand (observed
+       trips plus estimated unmet demand).
+    2. Track bikes at every station; a pickup succeeds only if a bike is
+       available, a return only if a dock is available.
+    3. Apply each strategy's rebalancing moves at the planned times.
+    4. Record rides served, rides lost, empty/full minutes, bikes moved, cost.
+
+  Financial assumptions (adjustable in the dashboard)
+    - Revenue per ride: casual and member values derived from Citi Bike's
+      published pricing (single ride, per-minute e-bike fees, annual
+      membership spread over average member rides).
+    - Rebalancing cost: van cost per hour, crew cost per hour, bikes per van
+      load, average speed in traffic.
+
+  Outputs
+    - Rides recovered vs. no rebalancing and vs. baselines
+    - Cost per ride recovered
+    - Net value per day and annualised
+    - Sensitivity analysis (pessimistic / expected / optimistic) on revenue
+      per ride, cost per move and budget level
+
+
+--------------------------------------------------------------------------------
+9. ASSUMPTIONS AND LIMITATIONS
+--------------------------------------------------------------------------------
+
+  - Demand during empty periods is not observed and is estimated.
+  - Rebalancing costs are not published; values are assumptions with
+    sensitivity analysis.
+  - Travel distance between stations uses straight-line distance with a
+    road-network factor, not exact routing.
+  - Weather from one central station is applied city-wide.
+  - Census data is 5-year average and does not change hourly.
+
+
+--------------------------------------------------------------------------------
+10. INTERACTIVE DASHBOARD
+--------------------------------------------------------------------------------
+
+  Tool: Streamlit / Power BI / Tableau
+
+  Page 1 - Executive overview: rides, empty/full minutes, cost, net value,
+           gain vs. baselines.
+  Page 2 - Demand explorer: map of stations coloured by demand / net flow;
+           filters for hour, day type, weather, rider type, cluster.
+  Page 3 - Forecast and risk: next-hours forecast per station, stations at
+           risk of running empty / full, SHAP reasons.
+  Page 4 - Rebalancing planner (core): map with arrows for recommended moves,
+           move list table, budget and cost sliders, expected rides
+           recovered and net value.
+  Page 5 - Strategy comparison: simulation results for B1 - B4.
+  Page 6 - Data and model quality: SSOT data-quality report, source
+           provenance, model metrics.
+
+
+--------------------------------------------------------------------------------
+11. TOOLS
+--------------------------------------------------------------------------------
+
+  Python (pandas, numpy, geopandas, scikit-learn, statsmodels, xgboost /
+  lightgbm, shap, scipy), DuckDB or PostgreSQL, requests (APIs), plotly /
+  folium (maps), Streamlit / Power BI / Tableau, GitHub.
+
+
+--------------------------------------------------------------------------------
+12. DELIVERABLES
+--------------------------------------------------------------------------------
+
+  1. Data-source provenance register (all sources S1 - S12)
+  2. Reproducible ingestion and integration pipeline
+  3. SSOT dataset with data dictionary and data-quality report
+  4. EDA and hypothesis-testing notebook
+  5. Clustering, forecasting and classification notebooks
+  6. Rebalancing recommendation and simulation notebook
+  7. Interactive dashboard
+  8. BADIR report and presentations for all three project stages
+
+
+--------------------------------------------------------------------------------
+13. PROJECT PLAN (three presentation stages)
+--------------------------------------------------------------------------------
+
+  Stage 1 - Business question, analysis plan, data
+    Business question, KPIs, hypotheses, all sources collected, SSOT built,
+    data-quality report, initial EDA.
+
+  Stage 2 - Insights
+    Hypothesis tests, station clustering, forecasting and risk models,
+    model comparison and explanations.
+
+  Stage 3 - Recommendations
+    Rebalancing plan, simulation vs. baselines, financial impact,
+    sensitivity analysis, final dashboard and report.
+
+
+--------------------------------------------------------------------------------
+14. SUCCESS CRITERIA
+--------------------------------------------------------------------------------
+
+  - SSOT integrates all sources with documented joins and passes all
+    data-quality checks.
+  - Forecasting models beat historical-average and seasonal-naive baselines.
+  - Risk model achieves useful recall of empty/full events at an acceptable
+    precision.
+  - RebalanceIQ recovers more rides per dollar than all baseline strategies
+    in simulation.
+  - Recommendations are explained in business language and adjustable in the
+    dashboard.

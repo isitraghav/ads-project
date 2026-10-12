@@ -1,0 +1,520 @@
+================================================================================
+StockIQ
+A Demand Forecasting and Inventory Optimization System for Iowa's
+State Liquor Distribution
+================================================================================
+
+Course       : Applied Data Science (ADS) - Interim Project
+Framework    : BADIR (Business question, Analysis plan, Data collection,
+               Insights, Recommendations)
+Final output : Integrated single-source-of-truth dataset, models, interactive
+               decision dashboard, and BADIR report
+
+
+--------------------------------------------------------------------------------
+1. EXECUTIVE SUMMARY
+--------------------------------------------------------------------------------
+
+Iowa is an alcoholic-beverage "control state": the Iowa Alcoholic Beverages
+Division (ABD) buys spirits from suppliers and sells them wholesale to every
+licensed retailer in the state (grocery stores, liquor stores, convenience
+stores, pharmacies). Every one of those wholesale orders is published as open
+data, including the state's purchase cost and selling price for each bottle.
+
+The ABD faces a classic inventory problem across thousands of products: order
+too little from suppliers and retailers cannot get what they want (lost sales
+and lost state revenue); order too much and money is tied up in warehouse
+stock. Demand changes with seasons, holidays, local events, prices and the
+economic conditions of each county.
+
+StockIQ integrates the state sales data with product, demographic, economic,
+weather and event data into one unified dataset, and uses it to:
+  1. explain what drives demand by product, category, county and week,
+  2. segment products and retailers by sales behaviour,
+  3. forecast weekly demand per product (state-wide and by region),
+  4. recommend purchase quantities, safety stock and reorder points per
+     product within a purchasing budget,
+  5. estimate the impact on fill rate, inventory investment and gross profit
+     compared with simpler ordering rules.
+
+
+--------------------------------------------------------------------------------
+2. PROBLEM STATEMENT
+--------------------------------------------------------------------------------
+
+Business problem
+  The ABD manages thousands of active products sold to over a thousand
+  retailers. Planners need to know:
+    - How many cases of each product will retailers order next week / month?
+    - Where (which regions and counties) will that demand occur?
+    - How much safety stock is needed for each product?
+    - With a limited purchasing budget, which products should be prioritised?
+
+Why it matters
+  - Liquor sales generate significant public revenue for the State of Iowa;
+    stockouts lose that revenue.
+  - Overstock ties up public funds and warehouse space.
+  - Demand is highly seasonal (holidays, summer, State Fair, football
+    season), so static ordering rules perform poorly.
+
+Primary business objective
+  Maximize expected gross profit from inventory decisions:
+      (state retail price - state cost) x units sold
+    - holding cost of inventory
+    - cost of lost sales from stockouts
+  subject to a purchasing budget and warehouse capacity.
+
+Policy relevance
+  Because the ABD is a public agency, the analysis also supports policy
+  questions: how demand responds to price, how consumption differs across
+  counties with different income and demographics, and how seasonal events
+  affect distribution needs.
+
+
+--------------------------------------------------------------------------------
+3. STAKEHOLDERS AND DECISIONS SUPPORTED
+--------------------------------------------------------------------------------
+
+  Stakeholder                 Decision supported
+  --------------------------  ---------------------------------------------------
+  ABD purchasing team         Purchase quantities and timing per product
+  Warehouse / logistics       Inventory levels, regional distribution
+  ABD finance                 Purchasing budget, inventory investment, profit
+  Category managers           Product range, service levels per category
+  State policy makers         Price and distribution policy, regional insights
+
+
+--------------------------------------------------------------------------------
+4. DATA SOURCES AND PROVENANCE
+--------------------------------------------------------------------------------
+
+All sources are official government portals, government APIs or official
+public records. No Kaggle data is used.
+
+  #  Source / Dataset                Provider (access)              Granularity
+  -- ------------------------------  -----------------------------  ------------------
+  S1 Iowa Liquor Sales               Iowa ABD via the Iowa Data Hub  One row per invoice
+                                     (data.iowa.gov), yearly         line (product x
+                                     datasets 2020-2024 exported     store x date)
+                                     through the Data Hub API
+                                     (idh-be.iowa.gov/api/v1)
+  S2 Iowa Liquor Products and        Iowa ABD via the Iowa Data Hub  One row per product /
+     Iowa Liquor Stores              (product catalogue: proof,      per store
+                                     age, pack, volume, list date,
+                                     case cost; store register)
+  S3 County demographics             US Census Bureau, American      County / ZIP (ZCTA)
+                                     Community Survey 2019-2023
+                                     5-year, table-based summary
+                                     files (www2.census.gov)
+  S4 Population estimates            US Census Bureau, Population    County x year
+                                     Estimates Program, vintage
+                                     2025 county totals
+  S5 Unemployment                    US Bureau of Labor Statistics,  County x month
+                                     Local Area Unemployment
+                                     Statistics (BLS public API)
+  S6 Personal income                 US Bureau of Economic Analysis, County x year
+                                     Regional Accounts CAINC1 and
+                                     CAINC30 (BEA bulk download)
+  S7 Consumer prices                 BLS Consumer Price Index,       Month
+                                     alcoholic beverages and
+                                     distilled spirits series
+                                     (BLS public API)
+  S8 Weather                         NOAA NCEI Global Historical     Weather station x day
+                                     Climatology Network - Daily
+                                     (26 Iowa first-order weather
+                                     stations)
+  S9 ZIP-to-county crosswalk and     US Census Bureau, 2020 ZCTA-    ZIP x county;
+     county boundaries               to-county relationship file and county polygons
+                                     cartographic boundary files
+  S10 Holidays and events            US federal holiday calendar     Day
+                                     (OPM); Iowa State Fair dates
+                                     (official State Fair site);
+                                     University of Iowa and Iowa
+                                     State home football schedules
+                                     (official athletics sites)
+
+Provenance documentation
+  For every source the project records: URL / endpoint, publisher, licence or
+  terms of use, date downloaded, time period covered, API query, number of
+  rows and columns, and known data issues.
+
+Study scope
+  - Period: 5 years (e.g. 2020 - 2024), allowing seasonal and trend analysis.
+  - Size: S1 alone contains millions of invoice lines for this period
+    (well above 100,000 rows); the modelling table (product x county x week)
+    also contains millions of rows.
+  - Forecasting and inventory decisions focus on the top products that
+    together make up about 80% of sales value, plus a sample of slow movers.
+
+
+--------------------------------------------------------------------------------
+5. SINGLE SOURCE OF TRUTH (SSOT): DATA INTEGRATION
+--------------------------------------------------------------------------------
+
+5.1 Integrated data model
+
+  The SSOT is a star schema stored as Parquet files (or a DuckDB / PostgreSQL
+  database):
+
+    fact_sales_line        one row per invoice line (cleaned S1)
+    fact_product_county_week
+                           one row per product per county per week
+                           (MAIN ANALYTICAL TABLE)
+    dim_product            one row per product (S1 + S2)
+    dim_store              one row per retailer (S1 + S2 store register, S9)
+    dim_county             one row per county per year/month (S3, S4, S5, S6)
+    dim_date               one row per day / week (S7, S8, S10)
+
+5.2 Identifiers and join logic
+
+  Join                          Key / method
+  ----------------------------  -----------------------------------------------
+  Sales -> products             item number (itemno) to product catalogue
+  Sales -> stores               store number; latest valid name / address kept
+  Stores -> counties            county number / name from S1; missing or
+                                inconsistent values filled via ZIP code using
+                                the Census ZCTA-to-county relationship file
+                                (largest land-area share); standardised
+                                to 5-digit county FIPS code
+  Counties -> Census / BLS /    county FIPS code + year (ACS, population,
+  BEA                           income) or + month (unemployment)
+  Sales -> weather              county mapped to nearest NOAA station; daily
+                                values aggregated to week
+  Sales -> calendar / CPI       date / week / month
+  Sales -> events               date; State Fair and football flags applied
+                                to host counties (Polk, Johnson, Story) and
+                                state-wide
+
+5.3 Schema and unit consistency
+
+  - Dates stored as ISO dates; weeks defined Monday - Sunday.
+  - Volumes standardised to litres (bottle volume in ml / 1000); sales
+    measured in bottles, litres and 9-litre cases.
+  - Money in US dollars; optional inflation adjustment to constant dollars
+    using CPI (S7).
+  - Text fields (county, city, category, vendor) standardised: upper/lower
+    case, spelling variants, renamed categories mapped to one current name.
+  - Consistent snake_case column names and data types.
+
+5.4 Duplicate handling
+
+  - Duplicate invoice line numbers removed.
+  - Exact duplicate rows removed; near-duplicates (same store, product, date,
+    quantity) reviewed.
+  - Products with multiple descriptions or vendors over time resolved to one
+    current record with history tracked.
+  - Stores with changed names / addresses kept as one store number.
+
+5.5 Data-quality checks
+
+  - Completeness: missing county, ZIP, store location, category.
+  - Validity: positive bottle counts, prices, volumes; dates within range.
+  - Consistency checks:
+      sale_dollars = bottles sold x state bottle retail
+      volume sold (litres) = bottles sold x bottle volume (ml) / 1000
+      state bottle retail > state bottle cost
+  - Returns / negative quantities identified and handled separately.
+  - Outliers: unusually large orders flagged and reviewed.
+  - Reconciliation: yearly totals compared with ABD published annual figures.
+  - All checks implemented as automated tests and summarised in a
+    data-quality report.
+
+5.6 Main analytical table: fact_product_county_week (40+ variables)
+
+  Keys and time
+    1  item_number             2  county_fips            3  week_start_date
+    4  year                    5  month                  6  week_of_year
+    7  is_holiday_week         8  holiday_name           9  is_state_fair_week
+    10 is_home_football_week
+
+  Demand and price (from sales)
+    11 bottles_sold            12 litres_sold            13 sale_dollars
+    14 n_orders                15 n_stores_ordering      16 state_bottle_cost
+    17 state_bottle_retail     18 unit_margin            19 price_change_pct
+    20 bottles_lag_1w          21 bottles_lag_4w         22 bottles_lag_52w
+    23 bottles_rolling_mean_4w 24 bottles_rolling_std_4w
+
+  Product attributes
+    25 category                26 category_group         27 vendor
+    28 bottle_volume_ml        29 pack_size              30 proof
+    31 age                     32 product_age_weeks      33 abc_class
+    34 xyz_class
+
+  County economics and demographics
+    35 population              36 population_21_plus     37 median_household_income
+    38 per_capita_income       39 unemployment_rate      40 median_age
+    41 pct_bachelor_or_higher  42 urban_rural_class      43 n_retailers_in_county
+
+  Weather and macro
+    44 avg_temperature_c       45 total_precipitation_mm 46 snow_days
+    47 cpi_alcoholic_beverages
+
+  Targets
+    bottles_sold next 1 - 4 weeks (forecasting).
+
+
+--------------------------------------------------------------------------------
+6. BADIR FRAMEWORK APPLIED
+--------------------------------------------------------------------------------
+
+6.1 B - BUSINESS QUESTION
+
+  "How much of each product should the ABD buy and hold each week, given
+   uncertain demand and a limited purchasing budget, to maximize gross profit
+   while maintaining a target service level for retailers?"
+
+  KPIs
+    - Fill rate (share of retailer demand served)
+    - Stockout weeks and lost sales ($)
+    - Average inventory value and inventory turnover
+    - Gross profit after holding and stockout costs
+    - Forecast accuracy (MAE, RMSE, MAPE / WAPE)
+
+
+6.2 A - ANALYSIS PLAN
+
+  Hypotheses (tested statistically)
+    H1  Demand peaks in December and around summer holidays
+        (ANOVA across months / holiday vs. non-holiday weeks).
+    H2  The Iowa State Fair and home football weeks increase demand in host
+        counties (t-test, event vs. comparable non-event weeks).
+    H3  Higher-income counties buy more premium (higher-price) products
+        (correlation / regression).
+    H4  Price increases reduce demand; sensitivity differs by category
+        (log-log regression for price elasticity).
+    H5  Category preferences differ between urban and rural counties
+        (chi-square test of independence).
+    H6  A small share of products generates most sales value (Pareto /
+        ABC analysis).
+    H7  Unemployment and economic conditions are associated with shifts
+        between premium and value products.
+
+  Analysis steps
+    1. Data integration into the SSOT and data-quality report.
+    2. Exploratory analysis and visualisation (time, geography, category,
+       price).
+    3. Hypothesis testing (H1 - H7).
+    4. Product and county segmentation (ABC-XYZ, clustering).
+    5. Demand forecasting (time series and regression models).
+    6. Inventory policy (safety stock, reorder point, order quantities).
+    7. Budget allocation and simulation against baseline rules.
+
+
+6.3 D - DATA COLLECTION AND PREPARATION
+
+  - Download S1 and S2 as full yearly exports from the Iowa Data Hub API;
+    pull BLS series (S5, S7) through the BLS public API; download Census,
+    BEA and NOAA files (S3, S4, S6, S8, S9) from the official servers;
+    collect S10 from official calendars.
+  - Clean each source (Section 5.5) and integrate into the SSOT (Section 5).
+  - Feature engineering: calendar and event flags, lags and rolling
+    statistics, price change, product age, ABC-XYZ class, county
+    economic indicators.
+  - Time-based train / validation / test split (e.g. train 2020 - 2023,
+    validate H1 2024, test H2 2024). No random shuffling of time-series data.
+
+
+6.4 I - INSIGHTS (METHODS AND MODELS)
+
+  Descriptive analytics
+    - Sales trends by year, month, week; category mix over time.
+    - County-level maps of sales per adult (21+) and premium share.
+    - Top products, vendors and categories; Pareto curve.
+
+  Segmentation
+    - ABC analysis (sales value) and XYZ analysis (demand variability,
+      coefficient of variation) for products.
+    - K-means clustering of counties using sales mix, income, population,
+      urbanisation; hierarchical clustering for comparison; elbow method and
+      silhouette score.
+
+  Price sensitivity
+    - Log-log regression of quantity on price with category, season and
+      county controls, giving price elasticity per category (descriptive).
+
+  Demand forecasting
+    Target: weekly bottles sold per product (state-wide and per county /
+    county cluster).
+    Models compared
+      - Baselines: naive (last week), seasonal naive (same week last year),
+        moving average (4 weeks).
+      - Time series: exponential smoothing (Holt-Winters), SARIMA.
+      - Regression: linear and regularised regression (Ridge / Lasso) with
+        calendar, price and economic features.
+      - Tree-based models: decision tree, random forest, gradient boosting.
+    Evaluation: MAE, RMSE, WAPE; rolling time-based cross-validation;
+    accuracy by ABC-XYZ class and category.
+    Forecast uncertainty: prediction intervals from forecast residuals
+    (standard deviation of errors per product), used for safety stock.
+
+  Explainability
+    - Regression coefficients and feature importance.
+    - SHAP values for tree-based models: global drivers (season, holidays,
+      price, events, county income) and product-level explanations, e.g.
+        "Forecast for product X is 40% above normal next week: Thanksgiving
+         week (+25%), price reduced 8% (+10%), football home game in Story
+         County (+5%)."
+
+
+6.5 R - RECOMMENDATIONS
+
+  Recommendation 1: Inventory policy per product (core decision)
+    For each product, using the forecast and its uncertainty:
+      d   = forecast average weekly demand
+      s   = standard deviation of forecast error (weekly)
+      L   = supplier lead time in weeks (assumption per vendor)
+      z   = service-level factor (e.g. 1.65 for 95%)
+      Safety stock      SS  = z x s x sqrt(L)
+      Reorder point     ROP = d x L + SS
+      Order quantity    EOQ = sqrt(2 x annual demand x order cost /
+                              holding cost per unit per year)
+    Service levels set by ABC class (e.g. A = 98%, B = 95%, C = 90%).
+    Optional single-period check (newsvendor) for seasonal / limited
+    products: optimal service level = unit margin / (unit margin + holding
+    cost).
+
+  Recommendation 2: Budget-constrained purchasing plan
+    When recommended purchases exceed the budget, products are ranked by
+    expected profit per dollar invested (unit margin x expected extra units
+    sold / unit cost) and funded in that order until the budget is used
+    (greedy allocation). Output: purchase list with quantities, cost,
+    expected service level and expected profit per product.
+
+  Recommendation 3: Seasonal and event planning
+    - Build-up of stock before December, summer holidays, State Fair and
+      football season, by region.
+
+  Recommendation 4: Range and policy insights
+    - Slow-moving, low-margin products to delist or order on demand.
+    - Price-sensitivity and regional-demand insights for state policy makers.
+
+
+--------------------------------------------------------------------------------
+7. BASELINES FOR COMPARISON
+--------------------------------------------------------------------------------
+
+  B1  Reorder last week's sales
+  B2  Moving average (4 weeks) + fixed 25% safety buffer
+  B3  Same week last year
+  B4  StockIQ: forecast-based safety stock, reorder point and order quantity
+  B5  StockIQ + budget-constrained purchasing plan
+
+
+--------------------------------------------------------------------------------
+8. SIMULATION AND FINANCIAL IMPACT
+--------------------------------------------------------------------------------
+
+  Simulation method
+    1. Replay the test period week by week, using actual retailer orders as
+       demand.
+    2. Start each product with an initial stock (e.g. 2 weeks of average
+       demand).
+    3. Each policy places purchase orders; they arrive after lead time L.
+    4. Units sold = min(demand, stock); lost sales = unmet demand.
+    5. Record sales, lost sales, inventory value, holding cost, gross profit.
+
+  Financial assumptions (adjustable in the dashboard)
+    - Unit cost and price: real values from the data (state bottle cost and
+      state bottle retail).
+    - Holding cost: annual percentage of inventory value (e.g. 15 - 25%).
+    - Order cost per purchase order; supplier lead times.
+    - Purchasing budget per week / month.
+
+  Outputs
+    - Fill rate, lost sales ($), average inventory value, inventory turnover,
+      gross profit for every policy
+    - Incremental profit and working capital released vs. baselines,
+      annualised
+    - Sensitivity analysis (pessimistic / expected / optimistic) on holding
+      cost, lead time and budget
+
+
+--------------------------------------------------------------------------------
+9. ASSUMPTIONS AND LIMITATIONS
+--------------------------------------------------------------------------------
+
+  - Retailer orders are used as demand; orders that could not be placed
+    because of stockouts are not observed.
+  - Actual ABD warehouse inventory is not published, so inventory is
+    simulated from an assumed starting level.
+  - Lead times, holding cost and order cost are assumptions with
+    sensitivity analysis.
+  - Price-elasticity estimates are observational (descriptive, not causal).
+  - Data covers wholesale sales to retailers, not individual consumer
+    purchases.
+
+
+--------------------------------------------------------------------------------
+10. INTERACTIVE DASHBOARD
+--------------------------------------------------------------------------------
+
+  Tool: Streamlit / Power BI / Tableau
+
+  Page 1 - Executive overview: sales, gross profit, fill rate, inventory
+           value, gain vs. baselines.
+  Page 2 - Demand explorer: trends, county map, category mix, filters for
+           product, category, vendor, county, period.
+  Page 3 - Segmentation: ABC-XYZ matrix, county clusters with profiles.
+  Page 4 - Forecasts: weekly forecast with prediction interval per product
+           and region, SHAP drivers.
+  Page 5 - Purchasing planner (core): recommended order quantities, safety
+           stock, reorder points; sliders for service level, holding cost,
+           lead time and budget; expected profit and fill rate.
+  Page 6 - Policy comparison: simulation results for B1 - B5.
+  Page 7 - Data and model quality: SSOT data-quality report, source
+           provenance, model metrics.
+
+
+--------------------------------------------------------------------------------
+11. TOOLS
+--------------------------------------------------------------------------------
+
+  Python (pandas, numpy, geopandas, scikit-learn, statsmodels, xgboost /
+  lightgbm, shap, scipy), requests / aria2 (downloads), DuckDB or PostgreSQL,
+  plotly (charts and maps), Streamlit / Power BI / Tableau, GitHub.
+
+
+--------------------------------------------------------------------------------
+12. DELIVERABLES
+--------------------------------------------------------------------------------
+
+  1. Data-source provenance register (all sources S1 - S10)
+  2. Reproducible ingestion and integration pipeline
+  3. SSOT dataset with data dictionary and data-quality report
+  4. EDA and hypothesis-testing notebook
+  5. Segmentation, price-sensitivity and forecasting notebooks
+  6. Inventory policy, budget allocation and simulation notebook
+  7. Interactive dashboard
+  8. BADIR report and presentations for all three project stages
+
+
+--------------------------------------------------------------------------------
+13. PROJECT PLAN (three presentation stages)
+--------------------------------------------------------------------------------
+
+  Stage 1 - Business question, analysis plan, data
+    Business question, KPIs, hypotheses, all sources collected, SSOT built,
+    data-quality report, initial EDA.
+
+  Stage 2 - Insights
+    Hypothesis tests, segmentation, price sensitivity, forecasting models,
+    model comparison and explanations.
+
+  Stage 3 - Recommendations
+    Inventory policy, purchasing plan, simulation vs. baselines, financial
+    impact, sensitivity analysis, final dashboard and report.
+
+
+--------------------------------------------------------------------------------
+14. SUCCESS CRITERIA
+--------------------------------------------------------------------------------
+
+  - SSOT integrates all sources with documented joins and passes all
+    data-quality checks.
+  - Forecasting models beat naive, seasonal-naive and moving-average
+    baselines.
+  - StockIQ achieves a higher fill rate and/or lower inventory investment
+    and higher gross profit than baseline ordering rules in simulation.
+  - Recommendations and drivers are explained in business language.
+  - Dashboard lets a non-technical manager change assumptions and see the
+    effect on purchasing recommendations.

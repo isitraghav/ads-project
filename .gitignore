@@ -1,0 +1,19 @@
+# Raw and processed data (~13 GB) - re-download with: bash scripts/download_all.sh
+*/data/raw/*
+!*/data/raw/_inventory.csv
+*/data/interim/
+*/data/processed/
+*.parquet
+*.zip
+*.aria2
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
